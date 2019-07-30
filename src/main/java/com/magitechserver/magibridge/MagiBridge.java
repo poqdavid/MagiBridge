@@ -4,23 +4,23 @@ import com.google.common.collect.Sets;
 import com.google.inject.Inject;
 import com.magitechserver.magibridge.config.ConfigManager;
 import com.magitechserver.magibridge.config.categories.ConfigCategory;
+import com.magitechserver.magibridge.discord.DiscordHandler;
+import com.magitechserver.magibridge.discord.MessageBuilder;
 import com.magitechserver.magibridge.discord.MessageListener;
 import com.magitechserver.magibridge.listeners.*;
 import com.magitechserver.magibridge.util.CommandHandler;
-import com.magitechserver.magibridge.util.FormatType;
-import com.magitechserver.magibridge.util.PresenceUpdater;
-import com.magitechserver.magibridge.util.TopicUpdater;
-import net.dv8tion.jda.core.AccountType;
-import net.dv8tion.jda.core.JDA;
-import net.dv8tion.jda.core.JDABuilder;
-import net.dv8tion.jda.core.entities.Game;
+import com.magitechserver.magibridge.config.FormatType;
+import net.dv8tion.jda.api.JDA;
+import net.dv8tion.jda.api.JDABuilder;
+import net.dv8tion.jda.api.entities.Activity;
+import net.dv8tion.jda.api.entities.TextChannel;
 import ninja.leaping.configurate.objectmapping.GuiceObjectMapperFactory;
 import org.slf4j.Logger;
 import org.spongepowered.api.Sponge;
 import org.spongepowered.api.config.ConfigDir;
+import org.spongepowered.api.data.key.Keys;
 import org.spongepowered.api.event.Listener;
 import org.spongepowered.api.event.game.GameReloadEvent;
-import org.spongepowered.api.event.game.state.GameInitializationEvent;
 import org.spongepowered.api.event.game.state.GamePostInitializationEvent;
 import org.spongepowered.api.event.game.state.GameStoppingEvent;
 import org.spongepowered.api.plugin.Dependency;
@@ -31,8 +31,8 @@ import org.spongepowered.api.util.Tristate;
 
 import javax.security.auth.login.LoginException;
 import java.io.File;
-import java.util.concurrent.CompletableFuture;
-import java.util.concurrent.Future;
+import java.lang.management.ManagementFactory;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Created by Frani on 22/06/2017.
@@ -49,9 +49,11 @@ import java.util.concurrent.Future;
 
 public class MagiBridge {
 
+    public static boolean useVanillaChat = false;
     public static MagiBridge instance = null;
     public static ConfigCategory Config;
     public static JDA jda;
+    private Task updaterTask;
 
     @Inject
     @ConfigDir(sharedRoot = false)
@@ -62,9 +64,6 @@ public class MagiBridge {
 
     @Inject
     private Logger logger;
-
-    private TopicUpdater updater;
-    private PresenceUpdater presenceUpdater;
 
     public static MagiBridge getInstance() {
         return instance;
@@ -104,62 +103,62 @@ public class MagiBridge {
             Task.builder().execute(() -> {
                 this.registerListeners();
 
+                if (!Config.MESSAGES.BOT_GAME_STATUS.isEmpty()) {
+                    jda.getPresence().setActivity(Activity.playing(Config.MESSAGES.BOT_GAME_STATUS));
+                }
+
                 if (!fake) {
                     DiscordHandler.init();
-                    DiscordHandler.sendMessageToChannel(Config.CHANNELS.MAIN_CHANNEL, Config.MESSAGES.SERVER_STARTING);
+
+                    MessageBuilder.forChannel(Config.CHANNELS.MAIN_CHANNEL)
+                            .format(FormatType.SERVER_STARTING)
+                            .useWebhook(false)
+                            .send();
                     CommandHandler.registerBroadcastCommand();
+                }
 
-                    if (updater != null) {
-                        if (updater.getState() == Thread.State.NEW) {
-                            updater.start();
-                        } else {
-                            updater.interrupt();
-                            updater = new TopicUpdater();
-                            updater.start();
-                        }
-                    } else {
-                        updater = new TopicUpdater();
-                        updater.start();
-                    }
+                if (getConfig().CORE.ENABLE_UPDATER && getJDA().getStatus() == JDA.Status.CONNECTED) {
+                    this.updaterTask = Task.builder()
+                            .interval(Math.max(MagiBridge.getConfig().CORE.UPDATER_INTERVAL, 10), TimeUnit.SECONDS)
+                            .execute(() -> {
+                                TextChannel channel = getJDA().getTextChannelById(MagiBridge.getConfig().CHANNELS.MAIN_CHANNEL);
+                                if (channel == null) {
+                                    logger.error("The main-discord-channel is INVALID, replace it with a valid one and restart the server!");
+                                    return;
+                                }
 
-                    if (presenceUpdater != null) {
-                        if (presenceUpdater.getState() == Thread.State.NEW) {
-                            presenceUpdater.start();
-                        } else {
-                            presenceUpdater.interrupt();
-                            presenceUpdater = new PresenceUpdater();
-                            presenceUpdater.start();
-                        }
-                    } else {
-                        presenceUpdater = new PresenceUpdater();
-                        presenceUpdater.start();
-                    }
+                                String topic = FormatType.TOPIC_FORMAT.get()
+                                        .replace("%players%", "" + Sponge.getServer().getOnlinePlayers().stream().filter(p -> !p.get(Keys.VANISH).orElse(false)).count())
+                                        .replace("%maxplayers%", Integer.valueOf(Sponge.getServer().getMaxPlayers()).toString())
+                                        .replace("%tps%", Long.valueOf(Math.round(Sponge.getServer().getTicksPerSecond())).toString())
+                                        .replace("%daysonline%", Long.valueOf(ManagementFactory.getRuntimeMXBean().getUptime() / (24 * 60 * 60 * 1000)).toString())
+                                        .replace("%hoursonline%", Long.valueOf((ManagementFactory.getRuntimeMXBean().getUptime() / (60 * 60 * 1000)) % 24).toString())
+                                        .replace("%minutesonline%", Long.valueOf((ManagementFactory.getRuntimeMXBean().getUptime() / (60 * 1000)) % 60).toString());
 
+                                channel.getManager().setTopic(topic).queue();
+                            })
+                            .submit(this);
                 }
             }).submit(instance);
         }).submit(instance);
     }
 
     public void stopStuff(Boolean fake) {
+        if (this.updaterTask != null) this.updaterTask.cancel();
+
         if (!fake) {
             if (jda != null) {
-                DiscordHandler.sendMessageToChannel(Config.CHANNELS.MAIN_CHANNEL, Config.MESSAGES.SERVER_STOPPING);
+                MessageBuilder.forChannel(Config.CHANNELS.MAIN_CHANNEL)
+                        .format(FormatType.SERVER_STOPPING)
+                        .useWebhook(false)
+                        .send();
+
                 DiscordHandler.close();
-                if (updater != null) updater.interrupt();
-                if (presenceUpdater != null) presenceUpdater.interrupt();
-                if (MagiBridge.shouldUpdateTopic()) {
-                    try {
-                        String topic = FormatType.OFFLINE_TOPIC_FORMAT.get();
-                            String[] IDs = MagiBridge.getConfig().CHANNELS.TOPIC_CHANNELS.split(",");
-                            for (String str_id : IDs) {
-                                if (!MagiBridge.updateTopic(str_id, topic)) {
-                                    MagiBridge.getLogger().error("The main-discord-channel is INVALID, replace it with a valid one and restart the server!");
-                                }
-                            }
-                    } catch (NullPointerException e) {
-                        e.printStackTrace();
-                    }
-                }
+
+                if (this.updaterTask != null) this.updaterTask.cancel();
+                TextChannel channel = getJDA().getTextChannelById(Config.CHANNELS.MAIN_CHANNEL);
+                if (channel != null) channel.getManager().setTopic(FormatType.OFFLINE_TOPIC_FORMAT.get()).queue();
+
                 jda.shutdown();
                 long time = System.currentTimeMillis();
                 while ((System.currentTimeMillis() - time < 10000) && (jda != null && jda.getStatus() != JDA.Status.SHUTDOWN)) {
@@ -187,7 +186,7 @@ public class MagiBridge {
 
     private boolean initJDA() {
         try {
-            jda = new JDABuilder(AccountType.BOT).setToken(Config.CORE.BOT_TOKEN).build().awaitReady();
+            jda = new JDABuilder(Config.CORE.BOT_TOKEN).build().awaitReady();
             jda.addEventListener(new MessageListener());
         } catch (LoginException e) {
             logger.error("ERROR STARTING THE PLUGIN:");
@@ -204,8 +203,9 @@ public class MagiBridge {
 
     private void registerListeners() {
         if (Config.CHANNELS.USE_NUCLEUS) {
+            useVanillaChat = true;
             if (Sponge.getPluginManager().getPlugin("nucleus").isPresent()) {
-                Sponge.getEventManager().registerListeners(this, new SpongeChatListener());
+                Sponge.getEventManager().registerListeners(this, new NucleusListeners());
                 logger.info("Hooking into Nucleus");
             } else {
                 logger.error(" ");
@@ -214,73 +214,28 @@ public class MagiBridge {
             }
         } else if (Config.CHANNELS.USE_UCHAT) {
             if (Sponge.getPluginManager().getPlugin("ultimatechat").isPresent()) {
-                Sponge.getEventManager().registerListeners(this, new ChatListener());
+                Sponge.getEventManager().registerListeners(this, new UChatListeners());
                 logger.info("Hooking into UltimateChat");
             } else {
                 logger.error(" ");
                 logger.error(" MagiBridge is configured to hook into UltimateChat, but it isn't loaded! Please disable using-ultimatechat or load UltimateChat on your server!");
                 logger.error(" ");
+                useVanillaChat = true;
             }
         } else {
-            Sponge.getEventManager().registerListeners(this, new VanillaChatListener());
             logger.info(" No Chat Hook enabled, hooking into the vanilla chat system");
             logger.info(" Some features may not work, and there will be no staff chat. If you want a more complete chat handling, use either Nucleus or UltimateChat.");
+            useVanillaChat = true;
         }
 
-        if (Config.CORE.DEATH_MESSAGES_ENABLED) {
-            Sponge.getEventManager().registerListeners(this, new DeathListener());
-        }
-
-        if (Config.CORE.ADVANCEMENT_MESSAGES_ENABLED) {
-            Sponge.getEventManager().registerListeners(this, new AdvancementListener());
-        }
-
-        Sponge.getEventManager().registerListeners(this, new SpongeLoginListener());
-    }
-
-    public static Boolean updateTopic(String id, String topic) {
-        try {
-            if (jda.getTextChannelById(id) == null) {
-                MagiBridge.getLogger().error("The main-discord-channel is INVALID, replace it with a valid one and restart the server!");
-                return false;
-            }
-
-            jda.getTextChannelById(id).getManager().setTopic(topic).queue();
-            return true;
-        } catch (NumberFormatException e) {
-            MagiBridge.getLogger().error("Error parsing the channel ID!");
-            e.printStackTrace();
-            return false;
-        }
-    }
-
-    public static Boolean shouldUpdateTopic()
-    {
-        if (MagiBridge.getConfig().CORE.ENABLE_UPDATER && jda.getStatus() == JDA.Status.CONNECTED && MagiBridge.getConfig().CHANNELS.TOPIC_CHANNELS != null && !MagiBridge.getConfig().CHANNELS.TOPIC_CHANNELS.isEmpty()) {
-                    return true;
-        }
-        return false;
-    }
-
-    public static Boolean updatePresence(String presence) {
-        try {
-                jda.getPresence().setGame(Game.playing(presence));
-                return true;
-        } catch (Exception e) {
-            e.printStackTrace();
-            return false;
-        }
-    }
-
-    public static Boolean shouldUpdatePresence()
-    {
-        if (MagiBridge.getConfig().CORE.ENABLE_PRESENCE_UPDATER && jda.getStatus() == JDA.Status.CONNECTED && MagiBridge.getConfig().MESSAGES.BOT_GAME_STATUS != null && !MagiBridge.getConfig().MESSAGES.BOT_GAME_STATUS.isEmpty()) {
-            return true;
-        }
-        return false;
+        Sponge.getEventManager().registerListeners(this, new VanillaListeners());
     }
 
     public static Logger getLogger() {
         return instance.logger;
+    }
+
+    public JDA getJDA() {
+        return jda;
     }
 }
